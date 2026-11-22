@@ -2,7 +2,8 @@ name: Generate Stats Images
 
 on:
   push:
-    branches: [ master ]
+    branches:
+      - master
   schedule:
     - cron: "5 0 * * *"
   workflow_dispatch:
@@ -10,46 +11,78 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash -euxo pipefail {0}
+
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-    # Check out repository under $GITHUB_WORKSPACE, so the job can access it
     - uses: actions/checkout@v7
 
-    # Run using Python 3.12 for consistency and aiohttp
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v7
+    - name: Cache Zig 0.16.0
+      uses: actions/cache@v6
       with:
-        python-version: '3.12'
-        architecture: 'x64'
-        cache: 'pip'
+        path: ~/.local/zig-0.16.0
+        key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}
 
-    # Install dependencies with `pip`
-    - name: Install requirements
+    - name: Install Zig 0.16.0
       run: |
-        python3 -m pip install --upgrade pip setuptools wheel
-        python3 -m pip install -r requirements.txt
+        if [[ ! -x "${HOME}/.local/zig-0.16.0/zig" ]]; then
+          case "$(uname -m)" in
+            x86_64)
+              zig_arch="x86_64"
+              zig_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+              ;;
+            aarch64)
+              zig_arch="aarch64"
+              zig_sha256="ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17"
+              ;;
+            *)
+              echo "Unsupported architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          tarball="zig-${zig_arch}-linux-0.16.0.tar.xz"
+          tmp_tar="${RUNNER_TEMP}/${tarball}"
+          curl -fsSL --retry 5 --retry-all-errors "https://ziglang.org/download/0.16.0/${tarball}" -o "${tmp_tar}"
+          echo "${zig_sha256}  ${tmp_tar}" | sha256sum -c -
+          mkdir -p "${HOME}/.local/zig-0.16.0"
+          tar -xJf "${tmp_tar}" --strip-components=1 -C "${HOME}/.local/zig-0.16.0"
+          rm -f "${tmp_tar}"
+        fi
+        echo "${HOME}/.local/zig-0.16.0" >> "${GITHUB_PATH}"
 
-    # Generate all statistics images
-    - name: Generate images
+    - name: Build
       run: |
-        python3 --version
-        python3 generate_images.py
-      env:
-        ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        EXCLUDED: ${{ secrets.EXCLUDED }}
-        EXCLUDED_LANGS: ${{ secrets.EXCLUDED_LANGS }}
-        EXCLUDE_FORKED_REPOS: true
+        zig version
+        zig build
 
-    # Commit all changed files to the repository
-    - name: Commit to the repo
+    - name: Checkout history branch
       run: |
         git config --global user.name "jstrieb/github-stats"
         git config --global user.email "github-stats[bot]@jstrieb.github.io"
+        # Push generated files to the generated branch
+        git fetch origin --no-tags
+        git checkout generated || git checkout -b generated
+
+    - name: Generate images
+      run: |
+        ./zig-out/bin/github-stats
+      env:
+        ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+        EXCLUDE_REPOS: ${{ secrets.EXCLUDE_REPOS }}
+        EXCLUDE_LANGS: ${{ secrets.EXCLUDE_LANGS }}
+        EXCLUDE_PRIVATE: "false"
+        SILENT: "true"
+        # TODO: Remove this when they get their API working again
+        # https://github.com/orgs/community/discussions/192970
+        MAX_RETRIES: 5
+
+    - name: Commit to the repo
+      run: |
         git add .
         # Force the build to succeed, even if no files were changed
         git commit -m 'Update generated files' || true
-        git push
+        git push --set-upstream origin generated
